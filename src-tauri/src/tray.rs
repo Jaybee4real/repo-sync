@@ -1,0 +1,94 @@
+use crate::scheduler::last_run_label;
+use crate::state::AppState;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager};
+
+const ID_SYNC: &str = "sync_now";
+const ID_OPEN: &str = "open_window";
+const ID_QUIT: &str = "quit";
+
+pub fn init(app: &AppHandle) -> tauri::Result<()> {
+    let menu = build_menu(app)?;
+
+    let _tray = TrayIconBuilder::with_id("main")
+        .icon(app.default_window_icon().unwrap().clone())
+        .icon_as_template(true)
+        .tooltip("repo-sync")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            ID_SYNC => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = crate::commands::sync_now(app).await;
+                });
+            }
+            ID_OPEN => {
+                show_window(app);
+            }
+            ID_QUIT => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::DoubleClick { .. } = event {
+                show_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let state = app.state::<AppState>();
+    let last_run = state.config.lock().unwrap().last_run.clone();
+    let report = state.last_report.lock().unwrap().clone();
+
+    let status_label = match &report {
+        Some(r) => {
+            let (u, ok, sk, f) = r.summary();
+            format!("● {} updated · {} ok · {} skipped · {} failed", u, ok, sk, f)
+        }
+        None => "● No sync run yet".to_string(),
+    };
+
+    let status_item = MenuItem::with_id(app, "status", &status_label, false, None::<&str>)?;
+    let last_run_item =
+        MenuItem::with_id(app, "last_run", &last_run_label(&last_run), false, None::<&str>)?;
+    let sync_item = MenuItem::with_id(app, ID_SYNC, "Sync now", true, Some("Cmd+R"))?;
+    let open_item = MenuItem::with_id(app, ID_OPEN, "Open dashboard…", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, ID_QUIT, "Quit repo-sync", true, Some("Cmd+Q"))?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+
+    Menu::with_items(
+        app,
+        &[
+            &status_item,
+            &last_run_item,
+            &sep1,
+            &sync_item,
+            &open_item,
+            &sep2,
+            &quit_item,
+        ],
+    )
+}
+
+/// Rebuild the tray menu (e.g. after a sync changes the status label).
+pub fn refresh(app: &AppHandle) {
+    if let Ok(menu) = build_menu(app) {
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
+fn show_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
