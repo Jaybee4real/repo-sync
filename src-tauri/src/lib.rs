@@ -15,6 +15,17 @@ pub fn run() {
     let cfg = config::load();
     let app_state = AppState::new(cfg);
 
+    // Hydrate `last_report` from disk so the tray doesn't claim "Never synced"
+    // when there's a saved report from earlier today (or yesterday).
+    {
+        let recent = reports::list_reports().into_iter().next();
+        if let Some(date) = recent {
+            if let Some(r) = reports::load_report(&date) {
+                *app_state.last_report.lock().unwrap() = Some(r);
+            }
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -33,6 +44,12 @@ pub fn run() {
             commands::load_report,
         ])
         .setup(|app| {
+            // Menu-bar-only on macOS: hide the Dock icon. Without this, the
+            // app appears as a regular app in the Dock and Cmd+Tab list,
+            // which is wrong for a tray utility.
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             let handle = app.handle().clone();
             tray::init(&handle)?;
             scheduler::start(handle.clone());
@@ -49,6 +66,13 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
+                // Restore tray-only behavior — drop the Dock icon now that
+                // the dashboard window is no longer visible.
+                #[cfg(target_os = "macos")]
+                {
+                    let app = window.app_handle();
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
             }
         })
         .run(tauri::generate_context!())

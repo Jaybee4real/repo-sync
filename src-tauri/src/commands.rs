@@ -8,6 +8,7 @@ pub fn get_config(state: tauri::State<'_, AppState>) -> config::AppConfig {
 
 #[tauri::command]
 pub fn set_config(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     new_config: config::AppConfig,
 ) -> Result<(), String> {
@@ -15,7 +16,11 @@ pub fn set_config(
         let mut cfg = state.config.lock().unwrap();
         *cfg = new_config.clone();
     }
-    config::save(&new_config).map_err(|e| e.to_string())
+    config::save(&new_config).map_err(|e| e.to_string())?;
+    // Tray label depends on config (specifically `last_run` formatting); refresh
+    // so any UI changes the user made show up immediately.
+    crate::tray::refresh(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -39,10 +44,25 @@ pub fn get_last_report(state: tauri::State<'_, AppState>) -> Option<repos::SyncR
     state.last_report.lock().unwrap().clone()
 }
 
-/// Run a sync now. Returns the final report. Emits `sync-started` /
-/// `sync-progress` / `sync-finished` events so the UI can show progress.
+/// Guard that flips `syncing` back to false on drop, even on early return /
+/// panic. Without this, an error path in `sync_now` would strand the UI on
+/// "Syncing…" forever and block subsequent sync attempts.
+struct SyncingGuard {
+    app: AppHandle,
+}
+impl Drop for SyncingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.app.state::<AppState>().syncing.lock() {
+            *s = false;
+        }
+    }
+}
+
+/// Run a sync now. Returns the final report. Emits `sync-started` and
+/// `sync-finished` events so the UI can show progress.
 #[tauri::command]
 pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
+    // Take the syncing flag atomically and arm a Drop guard so it can't leak.
     {
         let state = app.state::<AppState>();
         let mut s = state.syncing.lock().unwrap();
@@ -51,6 +71,7 @@ pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
         }
         *s = true;
     }
+    let _guard = SyncingGuard { app: app.clone() };
 
     let _ = app.emit("sync-started", ());
 
@@ -61,12 +82,22 @@ pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
     };
 
     // Heavy work on a blocking thread so we don't stall the runtime.
-    let report = tokio::task::spawn_blocking(move || {
+    let report_result = tauri::async_runtime::spawn_blocking(move || {
         let list = repos::scan(&root);
         repos::pull_all(&root, &list, &enabled)
     })
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
+
+    let report = match report_result {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("sync failed: {}", e);
+            // Notify the UI so it stops showing "Syncing…"; guard will reset the flag.
+            let _ = app.emit("sync-failed", &msg);
+            crate::tray::refresh(&app);
+            return Err(msg);
+        }
+    };
 
     {
         let state = app.state::<AppState>();
@@ -79,12 +110,6 @@ pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
     let _ = reports::save_report(&report);
     let _ = app.emit("sync-finished", &report);
 
-    {
-        let state = app.state::<AppState>();
-        *state.syncing.lock().unwrap() = false;
-    }
-
-    // Update tray label
     crate::tray::refresh(&app);
 
     Ok(report)

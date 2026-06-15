@@ -87,8 +87,20 @@ pub fn refresh(app: &AppHandle) {
 }
 
 fn show_window(app: &AppHandle) {
+    // On macOS with `ActivationPolicy::Accessory` the app has no Dock presence,
+    // so `set_focus` alone won't make the window jump in front of whatever app
+    // is currently frontmost. Briefly switch the activation policy to Regular
+    // so the app is allowed to become frontmost, then switch back.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
+        let _ = win.unminimize();
         let _ = win.set_focus();
     }
+
+    // Note: we deliberately don't flip back to Accessory here. The Dock icon
+    // appears while the window is open (acceptable) and disappears again when
+    // the window is hidden — see `on_window_event` in lib.rs.
 }

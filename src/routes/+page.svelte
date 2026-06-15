@@ -16,6 +16,8 @@
 
   let unlistenStarted: UnlistenFn | null = null;
   let unlistenFinished: UnlistenFn | null = null;
+  let unlistenFailed: UnlistenFn | null = null;
+  let onVisible: (() => void) | null = null;
 
   onMount(async () => {
     await refresh();
@@ -26,15 +28,38 @@
     unlistenFinished = await listen<SyncReport>("sync-finished", async (e) => {
       syncing = false;
       lastReport = e.payload;
+      // Re-fetch config so `last_run` (and any other backend-side changes) are reflected.
+      config = await api.getConfig();
       const [u, ok, sk, f] = summary(e.payload);
       toast = `Sync done · ${u} updated · ${ok} ok · ${sk} skipped · ${f} failed`;
       await refreshReports();
     });
+    unlistenFailed = await listen<string>("sync-failed", (e) => {
+      syncing = false;
+      toast = `Sync failed: ${e.payload}`;
+    });
+
+    // The window may be hidden + shown via the tray rather than closed/reopened,
+    // so onMount only fires once. Refresh whenever the page becomes visible
+    // again so we don't show stale data after a scheduled sync ran in the
+    // background.
+    onVisible = () => {
+      if (document.visibilityState === "visible") {
+        refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
   });
 
   onDestroy(() => {
     unlistenStarted?.();
     unlistenFinished?.();
+    unlistenFailed?.();
+    if (onVisible) {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    }
   });
 
   async function refresh() {
