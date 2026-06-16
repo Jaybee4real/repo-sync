@@ -45,6 +45,8 @@ export interface SyncReport {
 export interface Editor {
   id: string;
   name: string;
+  icon: string | null;
+  is_reveal: boolean;
 }
 
 /** Mirror of PullResult::has_conflict in Rust. */

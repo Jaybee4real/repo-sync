@@ -37,13 +37,15 @@
   onMount(async () => {
     await refresh();
     editors = await api.listEditors();
-    // Restore the last-used editor; default to Windsurf, else the first found.
+    // Restore the last-used editor; default to Windsurf, else the first real
+    // editor. "Reveal in Finder" is never a default (it isn't an editor).
+    const real = editors.filter((e) => !e.is_reveal);
     const stored = localStorage.getItem("repo-sync.editor");
-    if (stored && editors.some((e) => e.id === stored)) {
+    if (stored && real.some((e) => e.id === stored)) {
       selectedEditor = stored;
     } else {
       selectedEditor =
-        (editors.find((e) => e.id === "windsurf") ?? editors[0])?.id ?? "";
+        (real.find((e) => e.id === "windsurf") ?? real[0])?.id ?? "";
     }
     unlistenStarted = await listen("sync-started", () => {
       syncing = true;
@@ -136,8 +138,14 @@
     }
   }
 
+  let realEditors = $derived(editors.filter((e) => !e.is_reveal));
+  let revealEditor = $derived(editors.find((e) => e.is_reveal) ?? null);
+
+  function selectedEditorObj() {
+    return editors.find((e) => e.id === selectedEditor) ?? null;
+  }
   function selectedEditorName(): string {
-    return editors.find((e) => e.id === selectedEditor)?.name ?? "editor";
+    return selectedEditorObj()?.name ?? "editor";
   }
 
   function toggleMenu(key: string) {
@@ -151,6 +159,12 @@
     localStorage.setItem("repo-sync.editor", editorId);
     menuOpen = null;
     openIn(editorId, path);
+  }
+
+  // Reveal is a one-off action — open the folder without changing the default.
+  function revealOnly(path: string) {
+    menuOpen = null;
+    openIn("reveal", path);
   }
 
   interface Summary {
@@ -310,9 +324,11 @@
                 <code class="conflict-name">{r.repo.rel_path}</code>
                 <span class="branch">on {r.original_branch}</span>
               </div>
-              {#if editors.length > 0}
+              {#if realEditors.length > 0}
+                {@const sel = selectedEditorObj()}
                 <div class="split-btn">
                   <button class="split-main" onclick={() => openIn(selectedEditor, r.repo.abs_path)}>
+                    {#if sel?.icon}<img class="ed-icon" src={sel.icon} alt="" />{/if}
                     Open in {selectedEditorName()}
                   </button>
                   <button
@@ -323,16 +339,28 @@
                   >▾</button>
                   {#if menuOpen === r.repo.rel_path}
                     <div class="split-menu">
-                      {#each editors as ed}
+                      {#each realEditors as ed}
                         <button
                           class="split-item"
                           class:current={ed.id === selectedEditor}
                           onclick={() => chooseEditor(ed.id, r.repo.abs_path)}
                         >
-                          {ed.name}
+                          <span class="item-left">
+                            {#if ed.icon}<img class="ed-icon" src={ed.icon} alt="" />{:else}<span class="ed-icon ed-fallback"></span>{/if}
+                            {ed.name}
+                          </span>
                           {#if ed.id === selectedEditor}<span class="check">✓</span>{/if}
                         </button>
                       {/each}
+                      {#if revealEditor}
+                        <div class="split-sep"></div>
+                        <button class="split-item" onclick={() => revealOnly(r.repo.abs_path)}>
+                          <span class="item-left">
+                            {#if revealEditor.icon}<img class="ed-icon" src={revealEditor.icon} alt="" />{:else}<span class="ed-icon ed-fallback"></span>{/if}
+                            {revealEditor.name}
+                          </span>
+                        </button>
+                      {/if}
                     </div>
                   {/if}
                 </div>
@@ -427,10 +455,15 @@
         </label>
         <button class="primary" onclick={saveSettings}>Save settings</button>
 
-        {#if editors.length > 0}
+        {#if realEditors.length > 0}
           <div class="detected">
             <span class="muted">Detected editors:</span>
-            {#each editors as ed}<span class="badge">{ed.name}</span>{/each}
+            {#each realEditors as ed}
+              <span class="badge badge-ed">
+                {#if ed.icon}<img class="ed-icon" src={ed.icon} alt="" />{/if}
+                {ed.name}
+              </span>
+            {/each}
           </div>
         {/if}
       {/if}
@@ -522,6 +555,13 @@
     border: 1px solid #d0d0d0; background: #fff; color: inherit;
     font-size: 12.5px; padding: 5px 12px; cursor: pointer;
   }
+  .split-main { display: inline-flex; align-items: center; gap: 7px; }
+  .ed-icon { width: 16px; height: 16px; border-radius: 3px; object-fit: contain; flex: 0 0 auto; }
+  .ed-fallback { background: #c8c8c8; border-radius: 4px; }
+  @media (prefers-color-scheme: dark) { .ed-fallback { background: #555; } }
+  .item-left { display: inline-flex; align-items: center; gap: 9px; }
+  .split-sep { height: 1px; background: #e2e2e2; margin: 4px 0; }
+  @media (prefers-color-scheme: dark) { .split-sep { background: #444; } }
   .split-main { border-radius: 6px 0 0 6px; }
   .split-caret { border-left: none; border-radius: 0 6px 6px 0; padding: 5px 9px; font-size: 11px; }
   .split-main:hover, .split-caret:hover, .split-caret.active { background: #f0f0f0; }
@@ -589,7 +629,8 @@
   .settings .row { display: flex; gap: 16px; } .settings .row label { flex: 1; }
   .settings .checkbox { flex-direction: row; align-items: center; gap: 8px; }
   .settings .checkbox input { margin: 0; }
-  .detected { margin-top: 18px; padding-top: 14px; border-top: 1px solid #ececec; }
+  .detected { margin-top: 18px; padding-top: 14px; border-top: 1px solid #ececec; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge-ed { display: inline-flex; align-items: center; gap: 6px; }
   @media (prefers-color-scheme: dark) { .detected { border-top-color: #2e2e2e; } }
 
   .empty { text-align: center; color: #888; padding: 40px; }
