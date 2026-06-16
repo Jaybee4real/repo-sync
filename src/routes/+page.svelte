@@ -19,6 +19,8 @@
   let selectedReportDate = $state<string>("");
   let viewingReport = $state<SyncReport | null>(null);
   let editors = $state<Editor[]>([]);
+  let selectedEditor = $state<string>("");
+  let menuOpen = $state<string | null>(null);
   let tab = $state<"repos" | "conflicts" | "report" | "settings">("repos");
   let syncing = $state(false);
   let toast = $state<string>("");
@@ -35,6 +37,14 @@
   onMount(async () => {
     await refresh();
     editors = await api.listEditors();
+    // Restore the last-used editor; default to Windsurf, else the first found.
+    const stored = localStorage.getItem("repo-sync.editor");
+    if (stored && editors.some((e) => e.id === stored)) {
+      selectedEditor = stored;
+    } else {
+      selectedEditor =
+        (editors.find((e) => e.id === "windsurf") ?? editors[0])?.id ?? "";
+    }
     unlistenStarted = await listen("sync-started", () => {
       syncing = true;
       toast = "Syncing…";
@@ -124,6 +134,23 @@
     } catch (e) {
       toast = `Couldn't open: ${e}`;
     }
+  }
+
+  function selectedEditorName(): string {
+    return editors.find((e) => e.id === selectedEditor)?.name ?? "editor";
+  }
+
+  function toggleMenu(key: string) {
+    menuOpen = menuOpen === key ? null : key;
+  }
+
+  // Pick an editor from the dropdown: remember it as the new default and open
+  // the repo in it right away.
+  function chooseEditor(editorId: string, path: string) {
+    selectedEditor = editorId;
+    localStorage.setItem("repo-sync.editor", editorId);
+    menuOpen = null;
+    openIn(editorId, path);
   }
 
   interface Summary {
@@ -279,18 +306,37 @@
         {#each conflicts as r (r.repo.rel_path)}
           <div class="conflict-card">
             <div class="conflict-head">
-              <div>
+              <div class="conflict-title">
                 <code class="conflict-name">{r.repo.rel_path}</code>
                 <span class="branch">on {r.original_branch}</span>
               </div>
-              <div class="open-in">
-                <span class="muted">Open in:</span>
-                {#each editors as ed}
-                  <button class="chip-btn" onclick={() => openIn(ed.id, r.repo.abs_path)}>
-                    {ed.name}
+              {#if editors.length > 0}
+                <div class="split-btn">
+                  <button class="split-main" onclick={() => openIn(selectedEditor, r.repo.abs_path)}>
+                    Open in {selectedEditorName()}
                   </button>
-                {/each}
-              </div>
+                  <button
+                    class="split-caret"
+                    class:active={menuOpen === r.repo.rel_path}
+                    aria-label="Choose editor"
+                    onclick={() => toggleMenu(r.repo.rel_path)}
+                  >▾</button>
+                  {#if menuOpen === r.repo.rel_path}
+                    <div class="split-menu">
+                      {#each editors as ed}
+                        <button
+                          class="split-item"
+                          class:current={ed.id === selectedEditor}
+                          onclick={() => chooseEditor(ed.id, r.repo.abs_path)}
+                        >
+                          {ed.name}
+                          {#if ed.id === selectedEditor}<span class="check">✓</span>{/if}
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
             </div>
             <ul class="conflict-reasons">
               {#if r.stash_conflict}
@@ -302,6 +348,9 @@
             </ul>
           </div>
         {/each}
+        {#if menuOpen}
+          <button class="menu-backdrop" aria-label="Close menu" onclick={() => (menuOpen = null)}></button>
+        {/if}
       {/if}
     </section>
   {/if}
@@ -460,13 +509,43 @@
 
   .hint { font-size: 13px; color: #777; margin: 0 0 14px; }
 
-  .conflict-card { border: 1px solid #f0c9c9; background: #fff7f7; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
-  @media (prefers-color-scheme: dark) { .conflict-card { border-color: #5a2a2a; background: #2a1f1f; } }
-  .conflict-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .conflict-card { border: 1px solid #e0483d; background: transparent; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  @media (prefers-color-scheme: dark) { .conflict-card { border-color: #b5453b; } }
+  /* Title left, action far right; the action wraps under only when cramped. */
+  .conflict-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; }
+  .conflict-title { min-width: 0; flex: 1 1 auto; }
   .conflict-name { font-size: 13.5px; font-weight: 600; margin-right: 8px; }
-  .open-in { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .chip-btn { background: #fff; border: 1px solid #d6b0b0; border-radius: 6px; padding: 3px 9px; font-size: 12px; }
-  @media (prefers-color-scheme: dark) { .chip-btn { background: #332626; border-color: #6a3a3a; } }
+
+  /* Split button: primary opens last-used editor; caret opens the picker. */
+  .split-btn { position: relative; display: inline-flex; flex: 0 0 auto; margin-left: auto; }
+  .split-main, .split-caret {
+    border: 1px solid #d0d0d0; background: #fff; color: inherit;
+    font-size: 12.5px; padding: 5px 12px; cursor: pointer;
+  }
+  .split-main { border-radius: 6px 0 0 6px; }
+  .split-caret { border-left: none; border-radius: 0 6px 6px 0; padding: 5px 9px; font-size: 11px; }
+  .split-main:hover, .split-caret:hover, .split-caret.active { background: #f0f0f0; }
+  @media (prefers-color-scheme: dark) {
+    .split-main, .split-caret { background: #2d2d2d; border-color: #474747; }
+    .split-main:hover, .split-caret:hover, .split-caret.active { background: #3a3a3a; }
+  }
+  .split-menu {
+    position: absolute; top: calc(100% + 4px); right: 0; z-index: 20;
+    min-width: 170px; background: #fff; border: 1px solid #d0d0d0; border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.16); overflow: hidden; padding: 4px;
+  }
+  @media (prefers-color-scheme: dark) { .split-menu { background: #2a2a2a; border-color: #474747; } }
+  .split-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    width: 100%; text-align: left; border: none; background: transparent; color: inherit;
+    padding: 7px 10px; font-size: 12.5px; border-radius: 5px; cursor: pointer;
+  }
+  .split-item:hover { background: #eef3ff; }
+  .split-item.current { font-weight: 600; }
+  .split-item .check { color: #2469e6; }
+  @media (prefers-color-scheme: dark) { .split-item:hover { background: #33405e; } .split-item .check { color: #6ba1ff; } }
+  .menu-backdrop { position: fixed; inset: 0; z-index: 15; background: transparent; border: none; padding: 0; cursor: default; }
+
   .conflict-reasons { margin: 10px 0 0; padding-left: 4px; list-style: none; }
   .conflict-reasons li { font-size: 12.5px; margin-bottom: 6px; line-height: 1.5; }
 
