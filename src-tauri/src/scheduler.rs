@@ -53,6 +53,19 @@ pub fn start(app: AppHandle) {
 
 fn should_catch_up(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
+
+    // Self-heal across upgrades: if we have no usable report, or the newest one
+    // predates the current schema, sync now regardless of `last_run` so the
+    // dashboard reflects the new data model instead of stale/empty data.
+    {
+        let report = state.last_report.lock().unwrap();
+        match &*report {
+            None => return true,
+            Some(r) if r.is_legacy() => return true,
+            _ => {}
+        }
+    }
+
     let cfg = state.config.lock().unwrap();
     match &cfg.last_run {
         None => true,

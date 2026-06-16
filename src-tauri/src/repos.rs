@@ -36,20 +36,31 @@ pub struct BranchResult {
 }
 
 /// Result of syncing a single repo across all its branches.
+///
+/// All of the v0.2 fields carry `#[serde(default)]` so that reports written by
+/// the older v0.1 schema (which only had `repo` + `outcome`) still deserialize
+/// — they degrade to an empty branch list rather than failing the whole load
+/// and poisoning hydration / the Reports dropdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullResult {
     pub repo: RepoInfo,
     /// The branch we started (and ended) on.
+    #[serde(default)]
     pub original_branch: String,
     /// Per-branch outcomes.
+    #[serde(default)]
     pub branches: Vec<BranchResult>,
     /// True if the repo had uncommitted changes that we stashed.
+    #[serde(default)]
     pub had_local_changes: bool,
     /// True if restoring stashed changes left conflict markers in the tree.
+    #[serde(default)]
     pub stash_conflict: bool,
     /// Set if the whole repo was skipped (e.g. no remote, or disabled).
+    #[serde(default)]
     pub skipped: Option<String>,
     /// Set on a hard failure (e.g. `git fetch` failed).
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -106,6 +117,15 @@ impl SyncReport {
 
     pub fn conflict_count(&self) -> u32 {
         self.results.iter().filter(|r| r.has_conflict()).count() as u32
+    }
+
+    /// True if this looks like a pre-v0.2 report (written before per-branch
+    /// data existed). Every v0.2 result records an `original_branch`; a legacy
+    /// report deserializes with that field empty for all entries. Used to
+    /// trigger a fresh sync after a version upgrade so the dashboard isn't
+    /// stuck showing schema-less data.
+    pub fn is_legacy(&self) -> bool {
+        !self.results.is_empty() && self.results.iter().all(|r| r.original_branch.is_empty())
     }
 }
 
