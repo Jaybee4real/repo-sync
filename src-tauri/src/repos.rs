@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
@@ -9,7 +10,7 @@ pub struct RepoInfo {
     pub rel_path: String,
     /// Absolute path.
     pub abs_path: PathBuf,
-    /// Current branch name, or "DETACHED".
+    /// Branch that was checked out when the sync started, or "DETACHED".
     pub branch: String,
     /// Whether origin remote exists.
     pub has_remote: bool,
@@ -17,17 +18,58 @@ pub struct RepoInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PullOutcome {
+pub enum BranchStatus {
+    /// Already at upstream.
     UpToDate,
-    Updated { commits: u32 },
-    Skipped { reason: String },
-    Failed { message: String },
+    /// Fast-forwarded by `commits` commits.
+    FastForwarded { commits: u32 },
+    /// Local and remote have both moved — cannot fast-forward. Needs attention.
+    Diverged { ahead: u32, behind: u32 },
+    /// Branch has no configured upstream, so nothing to pull.
+    NoUpstream,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchResult {
+    pub branch: String,
+    pub status: BranchStatus,
+}
+
+/// Result of syncing a single repo across all its branches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullResult {
     pub repo: RepoInfo,
-    pub outcome: PullOutcome,
+    /// The branch we started (and ended) on.
+    pub original_branch: String,
+    /// Per-branch outcomes.
+    pub branches: Vec<BranchResult>,
+    /// True if the repo had uncommitted changes that we stashed.
+    pub had_local_changes: bool,
+    /// True if restoring stashed changes left conflict markers in the tree.
+    pub stash_conflict: bool,
+    /// Set if the whole repo was skipped (e.g. no remote, or disabled).
+    pub skipped: Option<String>,
+    /// Set on a hard failure (e.g. `git fetch` failed).
+    pub error: Option<String>,
+}
+
+impl PullResult {
+    /// A repo "needs attention" if restoring stashed changes conflicted, or any
+    /// branch diverged and could not be fast-forwarded.
+    pub fn has_conflict(&self) -> bool {
+        self.stash_conflict
+            || self
+                .branches
+                .iter()
+                .any(|b| matches!(b.status, BranchStatus::Diverged { .. }))
+    }
+
+    pub fn updated_count(&self) -> u32 {
+        self.branches
+            .iter()
+            .filter(|b| matches!(b.status, BranchStatus::FastForwarded { .. }))
+            .count() as u32
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -39,22 +81,37 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
-    pub fn summary(&self) -> (u32, u32, u32, u32) {
+    /// (repos_with_updates, repos_clean, repos_skipped, repos_failed, repos_conflict)
+    pub fn summary(&self) -> (u32, u32, u32, u32, u32) {
         let mut updated = 0;
-        let mut up_to_date = 0;
+        let mut clean = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        let mut conflict = 0;
         for r in &self.results {
-            match &r.outcome {
-                PullOutcome::Updated { .. } => updated += 1,
-                PullOutcome::UpToDate => up_to_date += 1,
-                PullOutcome::Skipped { .. } => skipped += 1,
-                PullOutcome::Failed { .. } => failed += 1,
+            if r.error.is_some() {
+                failed += 1;
+            } else if r.skipped.is_some() {
+                skipped += 1;
+            } else if r.has_conflict() {
+                conflict += 1;
+            } else if r.updated_count() > 0 {
+                updated += 1;
+            } else {
+                clean += 1;
             }
         }
-        (updated, up_to_date, skipped, failed)
+        (updated, clean, skipped, failed, conflict)
+    }
+
+    pub fn conflict_count(&self) -> u32 {
+        self.results.iter().filter(|r| r.has_conflict()).count() as u32
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scanning
+// ---------------------------------------------------------------------------
 
 /// Scan `root` recursively (up to 5 levels deep) and return every git repo found.
 pub fn scan(root: &Path) -> Vec<RepoInfo> {
@@ -88,121 +145,250 @@ pub fn scan(root: &Path) -> Vec<RepoInfo> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Small git helpers
+// ---------------------------------------------------------------------------
+
+/// Run a git command in `repo`, returning (success, stdout, stderr).
+fn git(repo: &Path, args: &[&str]) -> (bool, String, String) {
+    match Command::new("git").args(args).current_dir(repo).output() {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        ),
+        Err(e) => (false, String::new(), e.to_string()),
+    }
+}
+
 fn current_branch(repo: &Path) -> String {
-    Command::new("git")
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "DETACHED".to_string())
+    let (ok, out, _) = git(repo, &["symbolic-ref", "--short", "HEAD"]);
+    if ok && !out.is_empty() {
+        out
+    } else {
+        "DETACHED".to_string()
+    }
 }
 
 fn has_origin(repo: &Path) -> bool {
-    Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    git(repo, &["remote", "get-url", "origin"]).0
 }
 
-fn head_sha(repo: &Path) -> Option<String> {
-    Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
+/// True if there are tracked, uncommitted changes (staged or unstaged).
+/// Untracked files are ignored — they don't block a fast-forward.
+fn has_tracked_changes(repo: &Path) -> bool {
+    let (_, out, _) = git(repo, &["status", "--porcelain", "--untracked-files=no"]);
+    !out.trim().is_empty()
+}
+
+fn stash_count(repo: &Path) -> u32 {
+    let (ok, out, _) = git(repo, &["stash", "list"]);
+    if !ok {
+        return 0;
+    }
+    out.lines().filter(|l| !l.trim().is_empty()).count() as u32
+}
+
+/// (ahead, behind) of `branch` relative to `upstream`.
+fn ahead_behind(repo: &Path, branch: &str, upstream: &str) -> Option<(u32, u32)> {
+    let spec = format!("{}...{}", branch, upstream);
+    let (ok, out, _) = git(repo, &["rev-list", "--left-right", "--count", &spec]);
+    if !ok {
+        return None;
+    }
+    let mut parts = out.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+/// (branch, upstream-or-empty) for every local branch.
+fn local_branches(repo: &Path) -> Vec<(String, String)> {
+    let (ok, out, _) = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)|%(upstream:short)",
+            "refs/heads",
+        ],
+    );
+    if !ok {
+        return Vec::new();
+    }
+    out.lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(2, '|');
+            let b = it.next()?.to_string();
+            let up = it.next().unwrap_or("").to_string();
+            if b.is_empty() {
                 None
+            } else {
+                Some((b, up))
             }
         })
+        .collect()
 }
 
-/// Run `git pull --ff-only` in `repo` and classify the outcome.
-pub fn pull(repo: &RepoInfo) -> PullOutcome {
-    if !repo.has_remote {
-        return PullOutcome::Skipped {
-            reason: "no origin remote".to_string(),
-        };
-    }
-    let before = head_sha(&repo.abs_path);
-    let out = match Command::new("git")
-        .args(["pull", "--ff-only", "--no-rebase"])
-        .current_dir(&repo.abs_path)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return PullOutcome::Failed {
-                message: format!("failed to spawn git: {}", e),
-            }
-        }
+// ---------------------------------------------------------------------------
+// The pull engine
+// ---------------------------------------------------------------------------
+
+/// Fetch and fast-forward every branch of a single repo.
+///
+/// Flow:
+/// 1. `git fetch --all --prune`
+/// 2. Stash tracked changes if the working tree is dirty.
+/// 3. For each local branch with an upstream:
+///    - up to date  -> record UpToDate
+///    - can ff      -> advance it (merge --ff-only for the current branch,
+///                     `branch -f` for the others) and record FastForwarded
+///    - diverged    -> record Diverged (never auto-merged)
+/// 4. Restore stashed changes with `git stash apply`. If that conflicts, leave
+///    the conflict markers in the tree and keep the stash (flagged for the user).
+pub fn pull(repo: &RepoInfo) -> PullResult {
+    let path = &repo.abs_path;
+    let original_branch = current_branch(path);
+
+    let mut result = PullResult {
+        repo: repo.clone(),
+        original_branch: original_branch.clone(),
+        branches: Vec::new(),
+        had_local_changes: false,
+        stash_conflict: false,
+        skipped: None,
+        error: None,
     };
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let msg = stderr
-            .lines()
-            .chain(stdout.lines())
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("git pull failed")
-            .to_string();
-        return PullOutcome::Failed { message: msg };
+    if !repo.has_remote {
+        result.skipped = Some("no origin remote".to_string());
+        return result;
     }
 
-    let after = head_sha(&repo.abs_path);
-    match (before, after) {
-        (Some(b), Some(a)) if b == a => PullOutcome::UpToDate,
-        (Some(b), Some(a)) => {
-            let commits = Command::new("git")
-                .args(["rev-list", "--count", &format!("{}..{}", b, a)])
-                .current_dir(&repo.abs_path)
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
-                .unwrap_or(0);
-            PullOutcome::Updated { commits }
-        }
-        _ => PullOutcome::UpToDate,
+    // 1. Fetch everything up front.
+    let (fok, _, ferr) = git(path, &["fetch", "--all", "--prune"]);
+    if !fok {
+        let msg = ferr.lines().last().unwrap_or("git fetch failed").to_string();
+        result.error = Some(msg);
+        return result;
     }
+
+    // 2. Stash if dirty.
+    let dirty = has_tracked_changes(path);
+    let mut did_stash = false;
+    if dirty {
+        let before = stash_count(path);
+        let (sok, _, _) = git(
+            path,
+            &["stash", "push", "-m", "repo-sync: auto-stash before update"],
+        );
+        did_stash = sok && stash_count(path) > before;
+        result.had_local_changes = did_stash;
+    }
+
+    // 3. Update each branch.
+    for (branch, upstream) in local_branches(path) {
+        if upstream.is_empty() {
+            result.branches.push(BranchResult {
+                branch,
+                status: BranchStatus::NoUpstream,
+            });
+            continue;
+        }
+        // Upstream ref must actually exist (it may have been pruned).
+        if !git(path, &["rev-parse", "--verify", "--quiet", &upstream]).0 {
+            result.branches.push(BranchResult {
+                branch,
+                status: BranchStatus::NoUpstream,
+            });
+            continue;
+        }
+
+        let (ahead, behind) = match ahead_behind(path, &branch, &upstream) {
+            Some(v) => v,
+            None => {
+                result.branches.push(BranchResult {
+                    branch,
+                    status: BranchStatus::NoUpstream,
+                });
+                continue;
+            }
+        };
+
+        if behind == 0 {
+            result.branches.push(BranchResult {
+                branch,
+                status: BranchStatus::UpToDate,
+            });
+            continue;
+        }
+        if ahead > 0 {
+            // Both sides moved — cannot fast-forward.
+            result.branches.push(BranchResult {
+                branch,
+                status: BranchStatus::Diverged { ahead, behind },
+            });
+            continue;
+        }
+
+        // Pure fast-forward (ahead == 0, behind > 0).
+        let advanced = if branch == original_branch {
+            git(path, &["merge", "--ff-only", &upstream]).0
+        } else {
+            // Safe: we verified this is a fast-forward.
+            git(path, &["branch", "-f", &branch, &upstream]).0
+        };
+
+        result.branches.push(BranchResult {
+            branch,
+            status: if advanced {
+                BranchStatus::FastForwarded { commits: behind }
+            } else {
+                BranchStatus::Diverged { ahead, behind }
+            },
+        });
+    }
+
+    // 4. Restore stashed changes.
+    if did_stash {
+        let (aok, _, _) = git(path, &["stash", "apply"]);
+        if aok {
+            // Clean restore — drop the now-redundant stash.
+            let _ = git(path, &["stash", "drop"]);
+        } else {
+            // Conflict (or other failure): keep the stash and flag it. The tree
+            // now contains conflict markers for the user to resolve.
+            result.stash_conflict = true;
+        }
+    }
+
+    result
 }
 
-/// Pull every repo in the list, filtered by `enabled` (key = `rel_path`).
+/// Pull every repo in the list, honoring the per-repo `enabled` map.
 pub fn pull_all(
     root: &Path,
     repos: &[RepoInfo],
-    enabled: &std::collections::HashMap<String, bool>,
+    enabled: &HashMap<String, bool>,
 ) -> SyncReport {
     let started_at = chrono::Local::now().to_rfc3339();
     let mut results = Vec::with_capacity(repos.len());
     for r in repos {
         let on = *enabled.get(&r.rel_path).unwrap_or(&true);
         if !on {
-            results.push(PullResult {
+            let mut pr = PullResult {
                 repo: r.clone(),
-                outcome: PullOutcome::Skipped {
-                    reason: "disabled".to_string(),
-                },
-            });
+                original_branch: r.branch.clone(),
+                branches: Vec::new(),
+                had_local_changes: false,
+                stash_conflict: false,
+                skipped: Some("disabled".to_string()),
+                error: None,
+            };
+            pr.skipped = Some("disabled".to_string());
+            results.push(pr);
             continue;
         }
-        let outcome = pull(r);
-        results.push(PullResult {
-            repo: r.clone(),
-            outcome,
-        });
+        results.push(pull(r));
     }
     SyncReport {
         started_at,

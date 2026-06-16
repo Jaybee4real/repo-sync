@@ -14,15 +14,25 @@ export interface RepoInfo {
   has_remote: boolean;
 }
 
-export type PullOutcome =
+export type BranchStatus =
   | { kind: "up_to_date" }
-  | { kind: "updated"; commits: number }
-  | { kind: "skipped"; reason: string }
-  | { kind: "failed"; message: string };
+  | { kind: "fast_forwarded"; commits: number }
+  | { kind: "diverged"; ahead: number; behind: number }
+  | { kind: "no_upstream" };
+
+export interface BranchResult {
+  branch: string;
+  status: BranchStatus;
+}
 
 export interface PullResult {
   repo: RepoInfo;
-  outcome: PullOutcome;
+  original_branch: string;
+  branches: BranchResult[];
+  had_local_changes: boolean;
+  stash_conflict: boolean;
+  skipped: string | null;
+  error: string | null;
 }
 
 export interface SyncReport {
@@ -30,4 +40,20 @@ export interface SyncReport {
   finished_at: string;
   root: string;
   results: PullResult[];
+}
+
+export interface Editor {
+  id: string;
+  name: string;
+}
+
+/** Mirror of PullResult::has_conflict in Rust. */
+export function hasConflict(r: PullResult): boolean {
+  return (
+    r.stash_conflict || r.branches.some((b) => b.status.kind === "diverged")
+  );
+}
+
+export function updatedCount(r: PullResult): number {
+  return r.branches.filter((b) => b.status.kind === "fast_forwarded").length;
 }

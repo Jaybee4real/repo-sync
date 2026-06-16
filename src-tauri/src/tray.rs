@@ -46,12 +46,23 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let last_run = state.config.lock().unwrap().last_run.clone();
     let report = state.last_report.lock().unwrap().clone();
 
-    let status_label = match &report {
+    let (status_label, conflicts) = match &report {
         Some(r) => {
-            let (u, ok, sk, f) = r.summary();
-            format!("● {} updated · {} ok · {} skipped · {} failed", u, ok, sk, f)
+            let (u, ok, sk, f, c) = r.summary();
+            (
+                format!(
+                    "{} {} updated · {} ok · {} skipped · {} failed · {} conflict",
+                    if c > 0 { "⚠" } else { "●" },
+                    u,
+                    ok,
+                    sk,
+                    f,
+                    c
+                ),
+                r.conflict_count(),
+            )
         }
-        None => "● No sync run yet".to_string(),
+        None => ("● No sync run yet".to_string(), 0),
     };
 
     let status_item = MenuItem::with_id(app, "status", &status_label, false, None::<&str>)?;
@@ -63,26 +74,66 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
 
-    Menu::with_items(
-        app,
-        &[
-            &status_item,
-            &last_run_item,
-            &sep1,
-            &sync_item,
-            &open_item,
-            &sep2,
-            &quit_item,
-        ],
-    )
+    if conflicts > 0 {
+        let conflict_item = MenuItem::with_id(
+            app,
+            ID_OPEN,
+            &format!("⚠ {} repo{} need attention…", conflicts, if conflicts == 1 { "" } else { "s" }),
+            true,
+            None::<&str>,
+        )?;
+        Menu::with_items(
+            app,
+            &[
+                &status_item,
+                &last_run_item,
+                &sep1,
+                &conflict_item,
+                &sync_item,
+                &open_item,
+                &sep2,
+                &quit_item,
+            ],
+        )
+    } else {
+        Menu::with_items(
+            app,
+            &[
+                &status_item,
+                &last_run_item,
+                &sep1,
+                &sync_item,
+                &open_item,
+                &sep2,
+                &quit_item,
+            ],
+        )
+    }
 }
 
-/// Rebuild the tray menu (e.g. after a sync changes the status label).
+/// Rebuild the tray menu (e.g. after a sync changes the status label) and
+/// update the menu-bar indicator: a "!" next to the icon when any repo has a
+/// conflict, cleared otherwise.
 pub fn refresh(app: &AppHandle) {
-    if let Ok(menu) = build_menu(app) {
-        if let Some(tray) = app.tray_by_id("main") {
+    let conflicts = {
+        let state = app.state::<AppState>();
+        let report = state.last_report.lock().unwrap();
+        report.as_ref().map(|r| r.conflict_count()).unwrap_or(0)
+    };
+
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Ok(menu) = build_menu(app) {
             let _ = tray.set_menu(Some(menu));
         }
+        // macOS shows this text next to the menu-bar icon. On Windows it's a
+        // no-op, but the tooltip below covers that platform.
+        let _ = tray.set_title(Some(if conflicts > 0 { "!" } else { "" }));
+        let tooltip = if conflicts > 0 {
+            format!("repo-sync — {} repo(s) need attention", conflicts)
+        } else {
+            "repo-sync".to_string()
+        };
+        let _ = tray.set_tooltip(Some(&tooltip));
     }
 }
 

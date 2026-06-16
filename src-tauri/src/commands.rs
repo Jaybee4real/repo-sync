@@ -1,5 +1,15 @@
-use crate::{config, repos, reports, state::AppState};
+use crate::{config, editors, repos, reports, state::AppState};
 use tauri::{AppHandle, Emitter, Manager};
+
+#[tauri::command]
+pub fn list_editors() -> Vec<editors::Editor> {
+    editors::detect()
+}
+
+#[tauri::command]
+pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
+    editors::open_in(&editor_id, &path)
+}
 
 #[tauri::command]
 pub fn get_config(state: tauri::State<'_, AppState>) -> config::AppConfig {

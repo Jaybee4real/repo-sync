@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod editors;
 mod reports;
 mod repos;
 mod scheduler;
@@ -42,6 +43,8 @@ pub fn run() {
             commands::get_last_report,
             commands::list_reports,
             commands::load_report,
+            commands::list_editors,
+            commands::open_in_editor,
         ])
         .setup(|app| {
             // Menu-bar-only on macOS: hide the Dock icon. Without this, the
@@ -52,6 +55,8 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tray::init(&handle)?;
+            // Reflect any hydrated conflict state in the menu-bar indicator.
+            tray::refresh(&handle);
             scheduler::start(handle.clone());
 
             // Hide the main window on first open — the tray is the primary UI.
