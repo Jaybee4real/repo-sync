@@ -5,6 +5,7 @@ use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
 const ID_SYNC: &str = "sync_now";
+const ID_PAUSE: &str = "toggle_pause";
 const ID_OPEN: &str = "open_window";
 const ID_QUIT: &str = "quit";
 
@@ -23,6 +24,16 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
                 tauri::async_runtime::spawn(async move {
                     let _ = crate::commands::sync_now(app).await;
                 });
+            }
+            ID_PAUSE => {
+                let updated = {
+                    let state = app.state::<AppState>();
+                    let mut cfg = state.config.lock().unwrap();
+                    cfg.paused = !cfg.paused;
+                    cfg.clone()
+                };
+                let _ = crate::config::save(&updated);
+                refresh(app);
             }
             ID_OPEN => {
                 show_window(app);
@@ -43,7 +54,10 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state = app.state::<AppState>();
-    let last_run = state.config.lock().unwrap().last_run.clone();
+    let (last_run, paused) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.last_run.clone(), cfg.paused)
+    };
     let report = state.last_report.lock().unwrap().clone();
 
     let (status_label, conflicts) = match &report {
@@ -69,6 +83,12 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let last_run_item =
         MenuItem::with_id(app, "last_run", &last_run_label(&last_run), false, None::<&str>)?;
     let sync_item = MenuItem::with_id(app, ID_SYNC, "Sync now", true, Some("Cmd+R"))?;
+    let pause_label = if paused {
+        "Resume scheduled syncs"
+    } else {
+        "Pause scheduled syncs"
+    };
+    let pause_item = MenuItem::with_id(app, ID_PAUSE, pause_label, true, None::<&str>)?;
     let open_item = MenuItem::with_id(app, ID_OPEN, "Open dashboard…", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, ID_QUIT, "Quit repo-sync", true, Some("Cmd+Q"))?;
     let sep1 = PredefinedMenuItem::separator(app)?;
@@ -90,6 +110,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 &sep1,
                 &conflict_item,
                 &sync_item,
+                &pause_item,
                 &open_item,
                 &sep2,
                 &quit_item,
@@ -103,6 +124,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
                 &last_run_item,
                 &sep1,
                 &sync_item,
+                &pause_item,
                 &open_item,
                 &sep2,
                 &quit_item,
@@ -115,10 +137,11 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 /// update the menu-bar indicator: a "!" next to the icon when any repo has a
 /// conflict, cleared otherwise.
 pub fn refresh(app: &AppHandle) {
-    let conflicts = {
+    let (conflicts, paused) = {
         let state = app.state::<AppState>();
         let report = state.last_report.lock().unwrap();
-        report.as_ref().map(|r| r.conflict_count()).unwrap_or(0)
+        let paused = state.config.lock().unwrap().paused;
+        (report.as_ref().map(|r| r.conflict_count()).unwrap_or(0), paused)
     };
 
     if let Some(tray) = app.tray_by_id("main") {
@@ -127,9 +150,18 @@ pub fn refresh(app: &AppHandle) {
         }
         // macOS shows this text next to the menu-bar icon. On Windows it's a
         // no-op, but the tooltip below covers that platform.
-        let _ = tray.set_title(Some(if conflicts > 0 { "!" } else { "" }));
+        let title = if conflicts > 0 {
+            "!"
+        } else if paused {
+            "⏸"
+        } else {
+            ""
+        };
+        let _ = tray.set_title(Some(title));
         let tooltip = if conflicts > 0 {
             format!("repo-sync — {} repo(s) need attention", conflicts)
+        } else if paused {
+            "repo-sync — scheduled syncs paused".to_string()
         } else {
             "repo-sync".to_string()
         };

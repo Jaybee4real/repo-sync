@@ -17,7 +17,7 @@ pub fn start(app: AppHandle) {
         // Catch-up: if last run was more than 24h ago (or never), sync at startup
         // — but wait 10 seconds first so the UI has a moment to come up.
         sleep(std::time::Duration::from_secs(10)).await;
-        if should_catch_up(&app) {
+        if !is_paused(&app) && should_catch_up(&app) {
             run_sync(&app).await;
         }
 
@@ -42,13 +42,21 @@ pub fn start(app: AppHandle) {
             // Guard against double-firing if config moved the target into the
             // future after we already passed it.
             if Local::now() >= target {
-                run_sync(&app).await;
-                // After running, sleep a minute so we don't immediately re-fire
-                // on the same minute boundary.
+                if !is_paused(&app) {
+                    run_sync(&app).await;
+                }
+                // After the fire window, sleep a minute so we don't immediately
+                // re-fire on the same minute boundary.
                 sleep(std::time::Duration::from_secs(60)).await;
             }
         }
     });
+}
+
+fn is_paused(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let paused = state.config.lock().unwrap().paused;
+    paused
 }
 
 fn should_catch_up(app: &AppHandle) -> bool {

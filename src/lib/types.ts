@@ -5,6 +5,14 @@ export interface AppConfig {
   repo_enabled: Record<string, boolean>;
   last_run: string | null;
   notify_on_finish: boolean;
+  paused: boolean;
+  keep_reports_days: number;
+}
+
+export interface SyncProgress {
+  index: number;
+  total: number;
+  repo: string;
 }
 
 export interface RepoInfo {

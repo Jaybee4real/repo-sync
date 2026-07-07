@@ -453,6 +453,15 @@
           <input type="checkbox" bind:checked={config.notify_on_finish} />
           <span>Show notification when sync finishes</span>
         </label>
+        <label class="checkbox">
+          <input type="checkbox" bind:checked={config.paused} />
+          <span>Pause scheduled syncs (manual "Sync now" still works)</span>
+        </label>
+        <label>
+          <span>Keep reports for (days)</span>
+          <input type="number" min="1" max="3650" bind:value={config.keep_reports_days} />
+          <small>Older daily reports are deleted after each sync.</small>
+        </label>
         <button class="primary" onclick={saveSettings}>Save settings</button>
 
         {#if realEditors.length > 0}

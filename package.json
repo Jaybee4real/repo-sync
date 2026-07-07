@@ -1,7 +1,7 @@
 {
   "name": "repo-sync",
-  "version": "0.2.0",
-  "description": "",
+  "version": "0.3.0",
+  "description": "Menu-bar app that keeps a folder of git repos fast-forwarded on a daily schedule",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -13,17 +13,20 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/api": "^2"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^26.1.0",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "typescript": "~5.6.2",
-    "vite": "^6.0.3",
-    "@tauri-apps/cli": "^2"
+    "vite": "^6.0.3"
+  },
+  "overrides": {
+    "cookie": "^0.7.2"
   }
 }

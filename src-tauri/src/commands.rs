@@ -6,9 +6,22 @@ pub fn list_editors() -> Vec<editors::Editor> {
     editors::detect()
 }
 
+/// Opens are confined to the configured root: the webview can only ask us to
+/// open repos we manage, not arbitrary filesystem paths.
 #[tauri::command]
-pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
-    editors::open_in(&editor_id, &path)
+pub fn open_in_editor(
+    state: tauri::State<'_, AppState>,
+    editor_id: String,
+    path: String,
+) -> Result<(), String> {
+    let root = state.config.lock().unwrap().root.clone();
+    let root = std::fs::canonicalize(&root).map_err(|e| format!("bad root: {}", e))?;
+    let target =
+        std::fs::canonicalize(&path).map_err(|_| format!("path does not exist: {}", path))?;
+    if !target.starts_with(&root) {
+        return Err("path is outside the configured root folder".to_string());
+    }
+    editors::open_in(&editor_id, &target.to_string_lossy())
 }
 
 #[tauri::command]
@@ -22,6 +35,7 @@ pub fn set_config(
     state: tauri::State<'_, AppState>,
     new_config: config::AppConfig,
 ) -> Result<(), String> {
+    new_config.validate()?;
     {
         let mut cfg = state.config.lock().unwrap();
         *cfg = new_config.clone();
@@ -85,16 +99,22 @@ pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
 
     let _ = app.emit("sync-started", ());
 
-    let (root, enabled) = {
+    let (root, enabled, keep_days) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        (cfg.root.clone(), cfg.repo_enabled.clone())
+        (cfg.root.clone(), cfg.repo_enabled.clone(), cfg.keep_reports_days)
     };
 
     // Heavy work on a blocking thread so we don't stall the runtime.
+    let progress_app = app.clone();
     let report_result = tauri::async_runtime::spawn_blocking(move || {
         let list = repos::scan(&root);
-        repos::pull_all(&root, &list, &enabled)
+        repos::pull_all(&root, &list, &enabled, |index, total, rel_path| {
+            let _ = progress_app.emit(
+                "sync-progress",
+                serde_json::json!({ "index": index, "total": total, "repo": rel_path }),
+            );
+        })
     })
     .await;
 
@@ -118,6 +138,7 @@ pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
     }
 
     let _ = reports::save_report(&report);
+    reports::prune(keep_days);
     let _ = app.emit("sync-finished", &report);
 
     crate::tray::refresh(&app);

@@ -25,6 +25,26 @@ pub fn load_report(date: &str) -> Option<SyncReport> {
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// Delete reports older than `keep_days`. Filenames are `YYYY-MM-DD.json`;
+/// anything that doesn't parse as a date is left alone.
+pub fn prune(keep_days: u32) {
+    let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days as i64);
+    let dir = reports_dir();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d") {
+                if date < cutoff {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
 pub fn list_reports() -> Vec<String> {
     let dir = reports_dir();
     let mut out = Vec::new();

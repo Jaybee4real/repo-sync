@@ -169,15 +169,78 @@ pub fn scan(root: &Path) -> Vec<RepoInfo> {
 // Small git helpers
 // ---------------------------------------------------------------------------
 
+/// Hard cap on any single git invocation. A fetch hung on a dead network or a
+/// credential prompt would otherwise stall the entire sync run forever.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Run a git command in `repo`, returning (success, stdout, stderr).
+///
+/// Hardening, since this runs unattended against every repo in the folder:
+/// - `core.fsmonitor=` — a repo's own .git/config can point fsmonitor at an
+///   arbitrary binary that git would then execute; force it off.
+/// - `GIT_TERMINAL_PROMPT=0` + ssh BatchMode — never wait on an interactive
+///   credential prompt that can't be answered from a tray app.
+/// - A hard timeout, after which the child is killed and the call fails.
 fn git(repo: &Path, args: &[&str]) -> (bool, String, String) {
-    match Command::new("git").args(args).current_dir(repo).output() {
-        Ok(o) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            String::from_utf8_lossy(&o.stderr).trim().to_string(),
-        ),
-        Err(e) => (false, String::new(), e.to_string()),
+    use std::io::Read;
+    use std::process::Stdio;
+    use wait_timeout::ChildExt;
+
+    let mut full_args: Vec<&str> = vec!["-c", "core.fsmonitor="];
+    full_args.extend_from_slice(args);
+
+    let spawned = Command::new("git")
+        .args(&full_args)
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => return (false, String::new(), e.to_string()),
+    };
+
+    // Drain the pipes on separate threads so a chatty command can't deadlock
+    // against a full pipe buffer while we wait on it.
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    match child.wait_timeout(GIT_TIMEOUT) {
+        Ok(Some(status)) => {
+            let out = stdout_reader.join().unwrap_or_default();
+            let err = stderr_reader.join().unwrap_or_default();
+            (status.success(), out.trim().to_string(), err.trim().to_string())
+        }
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            (
+                false,
+                String::new(),
+                format!("git {} timed out after {}s", args.first().unwrap_or(&""), GIT_TIMEOUT.as_secs()),
+            )
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            (false, String::new(), e.to_string())
+        }
     }
 }
 
@@ -385,17 +448,21 @@ pub fn pull(repo: &RepoInfo) -> PullResult {
 }
 
 /// Pull every repo in the list, honoring the per-repo `enabled` map.
+/// `progress` is called before each repo starts, with (index, total, rel_path).
 pub fn pull_all(
     root: &Path,
     repos: &[RepoInfo],
     enabled: &HashMap<String, bool>,
+    mut progress: impl FnMut(usize, usize, &str),
 ) -> SyncReport {
     let started_at = chrono::Local::now().to_rfc3339();
+    let total = repos.len();
     let mut results = Vec::with_capacity(repos.len());
-    for r in repos {
+    for (index, r) in repos.iter().enumerate() {
+        progress(index, total, &r.rel_path);
         let on = *enabled.get(&r.rel_path).unwrap_or(&true);
         if !on {
-            let mut pr = PullResult {
+            let pr = PullResult {
                 repo: r.clone(),
                 original_branch: r.branch.clone(),
                 branches: Vec::new(),
@@ -404,7 +471,6 @@ pub fn pull_all(
                 skipped: Some("disabled".to_string()),
                 error: None,
             };
-            pr.skipped = Some("disabled".to_string());
             results.push(pr);
             continue;
         }
