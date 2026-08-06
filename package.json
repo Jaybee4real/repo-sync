@@ -1,6 +1,6 @@
 {
   "name": "repo-sync",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Menu-bar app that keeps a folder of git repos fast-forwarded on a daily schedule",
   "type": "module",
   "scripts": {

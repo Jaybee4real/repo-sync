@@ -10,11 +10,14 @@ repo-sync makes that a non-event. Every morning it walks a folder of repos and f
 
 It never rewrites anything. If a branch has diverged from its upstream, it's flagged in the dashboard and left alone for a human.
 
+It works just as well for a backend engineer running a stack of services locally: point each repo at the branch it should track (`develop`, `main`, a release branch), have it pulled every morning before standup, and land back on your own feature branch afterwards. Repos you don't want touched can be switched off individually.
+
 ## What it does
 
 - Scans a configured root folder for every git repo nested up to 5 levels deep.
 - Fetches once per repo, then fast-forwards each local branch that is strictly behind its upstream. The checked-out branch gets `merge --ff-only`; the others are advanced with `branch -f` after verifying the move is a pure fast-forward.
-- Stashes uncommitted tracked changes before touching anything and restores them after. If the restore conflicts, the repo is flagged and the stash is kept.
+- Stashes uncommitted tracked changes before touching anything and restores them after. If the restore conflicts, the repo is flagged and the stash is kept. (Or, per your choice, skips dirty repos entirely and leaves them for you.)
+- Per-repo control: pick which repos are pulled, which branch each one checks out before pulling (a *target branch*, created as a tracking branch off the remote if it isn't local yet), which branch it lands on afterwards (a *fallback branch*), and which specific branches to fast-forward. Leave it all blank and a repo behaves exactly as before — every branch with an upstream, back on whatever was checked out.
 - Runs daily at a time you pick (default 8:00), catches up on launch if the machine was asleep, and can be paused from the tray without quitting.
 - Keeps per-day reports you can browse in the dashboard, pruned after a configurable number of days (default 90).
 - Emits a per-repo progress event stream while a sync runs.
@@ -32,7 +35,7 @@ npm run tauri dev       # hot reload
 npm run tauri build     # release: .app + .dmg on Mac, .msi + .exe on Windows
 ```
 
-Releases are built by CI: push a tag like `v0.3.0` and `.github/workflows/release.yml` produces artifacts for macOS (arm64 + x86_64) and Windows as a draft GitHub Release.
+Releases are built by CI: push a tag like `v0.4.0` and `.github/workflows/release.yml` produces artifacts for macOS (arm64 + x86_64) and Windows as a draft GitHub Release.
 
 ## Safety model
 

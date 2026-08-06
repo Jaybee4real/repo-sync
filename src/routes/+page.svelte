@@ -5,6 +5,7 @@
   import type {
     AppConfig,
     RepoInfo,
+    RepoSettings,
     SyncReport,
     PullResult,
     BranchStatus,
@@ -108,15 +109,36 @@
     }
   }
 
-  async function toggleRepo(rel: string, on: boolean) {
+  let expandedRepo = $state<string | null>(null);
+
+  function settingsFor(rel: string): RepoSettings {
+    const existing = config?.repo_settings?.[rel];
+    if (existing) return existing;
+    const enabled = config?.repo_enabled?.[rel] ?? true;
+    return { enabled, branches: [], target_branch: null, fallback_branch: null };
+  }
+
+  async function updateRepo(rel: string, patch: Partial<RepoSettings>) {
     if (!config) return;
-    config.repo_enabled[rel] = on;
+    const next = { ...settingsFor(rel), ...patch };
+    config.repo_settings = { ...config.repo_settings, [rel]: next };
     await api.setConfig(config);
   }
 
+  async function toggleRepo(rel: string, on: boolean) {
+    await updateRepo(rel, { enabled: on });
+  }
+
   function isEnabled(rel: string): boolean {
-    if (!config) return true;
-    return config.repo_enabled[rel] ?? true;
+    return settingsFor(rel).enabled;
+  }
+
+  /** Parse a comma/space/newline-separated branch list into a clean array. */
+  function parseBranches(text: string): string[] {
+    return text
+      .split(/[\s,]+/)
+      .map((b) => b.trim())
+      .filter(Boolean);
   }
 
   async function saveSettings() {
@@ -284,6 +306,7 @@
           <tbody>
             {#each repos as repo (repo.rel_path)}
               {@const last = lastResultFor(repo.rel_path)}
+              {@const s = settingsFor(repo.rel_path)}
               <tr class:disabled={!isEnabled(repo.rel_path)}>
                 <td>
                   <input type="checkbox" checked={isEnabled(repo.rel_path)}
@@ -292,6 +315,13 @@
                 <td>
                   <code>{repo.rel_path}</code>
                   {#if !repo.has_remote}<span class="badge muted">no remote</span>{/if}
+                  {#if s.target_branch || s.fallback_branch || s.branches.length}
+                    <span class="badge">custom</span>
+                  {/if}
+                  <button class="linklike"
+                    onclick={() => (expandedRepo = expandedRepo === repo.rel_path ? null : repo.rel_path)}>
+                    {expandedRepo === repo.rel_path ? "▾" : "▸"} branches
+                  </button>
                 </td>
                 <td><span class="branch">{repo.branch}</span></td>
                 <td>
@@ -301,6 +331,30 @@
                   </span>
                 </td>
               </tr>
+              {#if expandedRepo === repo.rel_path}
+                <tr class="repo-config">
+                  <td></td>
+                  <td colspan="3">
+                    <div class="repo-config-grid">
+                      <label>
+                        <span>Target branch <small>checked out before pulling</small></span>
+                        <input type="text" placeholder="e.g. develop" value={s.target_branch ?? ""}
+                          onchange={(e) => updateRepo(repo.rel_path, { target_branch: (e.target as HTMLInputElement).value.trim() || null })} />
+                      </label>
+                      <label>
+                        <span>Fall back to <small>branch to land on after</small></span>
+                        <input type="text" placeholder="your working branch" value={s.fallback_branch ?? ""}
+                          onchange={(e) => updateRepo(repo.rel_path, { fallback_branch: (e.target as HTMLInputElement).value.trim() || null })} />
+                      </label>
+                      <label class="wide">
+                        <span>Only pull these branches <small>comma-separated; empty = all</small></span>
+                        <input type="text" placeholder="e.g. develop, main" value={s.branches.join(", ")}
+                          onchange={(e) => updateRepo(repo.rel_path, { branches: parseBranches((e.target as HTMLInputElement).value) })} />
+                      </label>
+                    </div>
+                  </td>
+                </tr>
+              {/if}
             {/each}
           </tbody>
         </table>
@@ -449,6 +503,14 @@
           <label><span>Daily run hour</span><input type="number" min="0" max="23" bind:value={config.schedule_hour} /></label>
           <label><span>Minute</span><input type="number" min="0" max="59" bind:value={config.schedule_minute} /></label>
         </div>
+        <label>
+          <span>When a repo has uncommitted changes</span>
+          <select bind:value={config.on_dirty}>
+            <option value="stash">Stash, pull, then restore (never loses work)</option>
+            <option value="skip">Skip the repo, leave my changes untouched</option>
+          </select>
+          <small>Applies to every repo during the pull. Per-repo target/fallback branches are set on the Repos tab.</small>
+        </label>
         <label class="checkbox">
           <input type="checkbox" bind:checked={config.notify_on_finish} />
           <span>Show notification when sync finishes</span>
@@ -543,6 +605,16 @@
   .branch { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #888; }
   .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; background: #eee; font-size: 11px; margin-left: 6px; }
   @media (prefers-color-scheme: dark) { .badge { background: #333; } }
+  .linklike { background: none; border: none; color: #0a7; font-size: 11px; cursor: pointer; padding: 0 4px; margin-left: 4px; }
+  .linklike:hover { text-decoration: underline; }
+  .repo-config td { background: rgba(0, 0, 0, 0.03); }
+  @media (prefers-color-scheme: dark) { .repo-config td { background: rgba(255, 255, 255, 0.04); } }
+  .repo-config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; padding: 8px 4px 12px; }
+  .repo-config-grid label { display: flex; flex-direction: column; gap: 3px; }
+  .repo-config-grid label.wide { grid-column: 1 / -1; }
+  .repo-config-grid span { font-size: 12px; font-weight: 500; }
+  .repo-config-grid small { font-weight: 400; color: #888; }
+  .repo-config-grid input { padding: 5px 8px; }
 
   .status { width: 22px; display: inline-block; }
   .status-text { font-size: 12.5px; color: #666; }

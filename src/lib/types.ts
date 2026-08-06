@@ -1,8 +1,24 @@
+/** Per-repo pull configuration (branch targets + enable). */
+export interface RepoSettings {
+  enabled: boolean;
+  /** Explicit branches to fast-forward; empty = every branch with an upstream. */
+  branches: string[];
+  /** Check this branch out before pulling. null = don't switch. */
+  target_branch: string | null;
+  /** Check this branch out after pulling. null = return to the original. */
+  fallback_branch: string | null;
+}
+
+export type DirtyPolicy = "stash" | "skip";
+
 export interface AppConfig {
   root: string;
   schedule_hour: number;
   schedule_minute: number;
+  /** Legacy enable map, superseded by repo_settings (kept for migration). */
   repo_enabled: Record<string, boolean>;
+  repo_settings: Record<string, RepoSettings>;
+  on_dirty: DirtyPolicy;
   last_run: string | null;
   notify_on_finish: boolean;
   paused: boolean;
@@ -36,6 +52,7 @@ export interface BranchResult {
 export interface PullResult {
   repo: RepoInfo;
   original_branch: string;
+  final_branch: string;
   branches: BranchResult[];
   had_local_changes: boolean;
   stash_conflict: boolean;

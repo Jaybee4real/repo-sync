@@ -1,5 +1,5 @@
+use crate::config::{AppConfig, DirtyPolicy, RepoSettings};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
@@ -44,9 +44,13 @@ pub struct BranchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullResult {
     pub repo: RepoInfo,
-    /// The branch we started (and ended) on.
+    /// The branch that was checked out when the run started.
     #[serde(default)]
     pub original_branch: String,
+    /// The branch the repo was left on when the run finished (may differ from
+    /// `original_branch` when a target/fallback branch is configured).
+    #[serde(default)]
+    pub final_branch: String,
     /// Per-branch outcomes.
     #[serde(default)]
     pub branches: Vec<BranchResult>,
@@ -312,6 +316,28 @@ fn local_branches(repo: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Check out `branch`, creating a local tracking branch off `origin/<branch>`
+/// if it doesn't exist locally. Returns true if we end up on it. Best-effort:
+/// callers must have a clean/stashed tree first so the checkout can't fail dirty.
+fn checkout(repo: &Path, branch: &str) -> bool {
+    if current_branch(repo) == branch {
+        return true;
+    }
+    let local_ref = format!("refs/heads/{}", branch);
+    if git(repo, &["rev-parse", "--verify", "--quiet", &local_ref]).0 {
+        return git(repo, &["checkout", branch]).0;
+    }
+    let remote_ref = format!("refs/remotes/origin/{}", branch);
+    if git(repo, &["rev-parse", "--verify", "--quiet", &remote_ref]).0 {
+        return git(
+            repo,
+            &["checkout", "-b", branch, "--track", &format!("origin/{}", branch)],
+        )
+        .0;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // The pull engine
 // ---------------------------------------------------------------------------
@@ -328,13 +354,14 @@ fn local_branches(repo: &Path) -> Vec<(String, String)> {
 ///    - diverged    -> record Diverged (never auto-merged)
 /// 4. Restore stashed changes with `git stash apply`. If that conflicts, leave
 ///    the conflict markers in the tree and keep the stash (flagged for the user).
-pub fn pull(repo: &RepoInfo) -> PullResult {
+pub fn pull(repo: &RepoInfo, settings: &RepoSettings, on_dirty: DirtyPolicy) -> PullResult {
     let path = &repo.abs_path;
     let original_branch = current_branch(path);
 
     let mut result = PullResult {
         repo: repo.clone(),
         original_branch: original_branch.clone(),
+        final_branch: original_branch.clone(),
         branches: Vec::new(),
         had_local_changes: false,
         stash_conflict: false,
@@ -355,8 +382,12 @@ pub fn pull(repo: &RepoInfo) -> PullResult {
         return result;
     }
 
-    // 2. Stash if dirty.
+    // 2. Dirty working tree: stash it, or leave the repo alone per policy.
     let dirty = has_tracked_changes(path);
+    if dirty && on_dirty == DirtyPolicy::Skip {
+        result.skipped = Some("uncommitted changes (on_dirty = skip)".to_string());
+        return result;
+    }
     let mut did_stash = false;
     if dirty {
         let before = stash_count(path);
@@ -368,24 +399,34 @@ pub fn pull(repo: &RepoInfo) -> PullResult {
         result.had_local_changes = did_stash;
     }
 
-    // 3. Update each branch.
-    for (branch, upstream) in local_branches(path) {
-        if upstream.is_empty() {
-            result.branches.push(BranchResult {
-                branch,
-                status: BranchStatus::NoUpstream,
-            });
-            continue;
+    // 3. Optionally switch to the configured target branch (tree is clean now).
+    if let Some(target) = settings.target_branch.as_deref() {
+        if !target.is_empty() {
+            checkout(path, target);
         }
-        // Upstream ref must actually exist (it may have been pruned).
-        if !git(path, &["rev-parse", "--verify", "--quiet", &upstream]).0 {
-            result.branches.push(BranchResult {
-                branch,
-                status: BranchStatus::NoUpstream,
-            });
-            continue;
-        }
+    }
+    let checked_out = current_branch(path);
 
+    // 4. Fast-forward branches. A pinned list restricts to those; otherwise every
+    //    local branch with an upstream.
+    let only: Option<std::collections::HashSet<&str>> = if settings.branches.is_empty() {
+        None
+    } else {
+        Some(settings.branches.iter().map(String::as_str).collect())
+    };
+    for (branch, upstream) in local_branches(path) {
+        if only.as_ref().map_or(false, |set| !set.contains(branch.as_str())) {
+            continue;
+        }
+        if upstream.is_empty()
+            || !git(path, &["rev-parse", "--verify", "--quiet", &upstream]).0
+        {
+            result.branches.push(BranchResult {
+                branch,
+                status: BranchStatus::NoUpstream,
+            });
+            continue;
+        }
         let (ahead, behind) = match ahead_behind(path, &branch, &upstream) {
             Some(v) => v,
             None => {
@@ -396,7 +437,6 @@ pub fn pull(repo: &RepoInfo) -> PullResult {
                 continue;
             }
         };
-
         if behind == 0 {
             result.branches.push(BranchResult {
                 branch,
@@ -405,22 +445,17 @@ pub fn pull(repo: &RepoInfo) -> PullResult {
             continue;
         }
         if ahead > 0 {
-            // Both sides moved — cannot fast-forward.
             result.branches.push(BranchResult {
                 branch,
                 status: BranchStatus::Diverged { ahead, behind },
             });
             continue;
         }
-
-        // Pure fast-forward (ahead == 0, behind > 0).
-        let advanced = if branch == original_branch {
+        let advanced = if branch == checked_out {
             git(path, &["merge", "--ff-only", &upstream]).0
         } else {
-            // Safe: we verified this is a fast-forward.
             git(path, &["branch", "-f", &branch, &upstream]).0
         };
-
         result.branches.push(BranchResult {
             branch,
             status: if advanced {
@@ -431,28 +466,43 @@ pub fn pull(repo: &RepoInfo) -> PullResult {
         });
     }
 
-    // 4. Restore stashed changes.
+    // 5. Land on the right branch and restore any stashed work. Stashed WIP
+    //    belongs to `original_branch`, so it is always restored there (switching
+    //    away first would strand it). A clean tree honours `fallback_branch`,
+    //    else returns to the original when a target moved us.
     if did_stash {
+        if current_branch(path) != original_branch {
+            checkout(path, &original_branch);
+        }
         let (aok, _, _) = git(path, &["stash", "apply"]);
         if aok {
-            // Clean restore — drop the now-redundant stash.
             let _ = git(path, &["stash", "drop"]);
         } else {
-            // Conflict (or other failure): keep the stash and flag it. The tree
-            // now contains conflict markers for the user to resolve.
             result.stash_conflict = true;
+        }
+    } else {
+        let land = settings
+            .fallback_branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+            .or_else(|| (checked_out != original_branch).then(|| original_branch.clone()));
+        if let Some(dest) = land {
+            checkout(path, &dest);
         }
     }
 
+    result.final_branch = current_branch(path);
     result
 }
 
-/// Pull every repo in the list, honoring the per-repo `enabled` map.
-/// `progress` is called before each repo starts, with (index, total, rel_path).
+/// Pull every repo in the list, honoring each repo's `RepoSettings` and the
+/// global dirty-tree policy. `progress` is called before each repo starts, with
+/// (index, total, rel_path).
 pub fn pull_all(
     root: &Path,
     repos: &[RepoInfo],
-    enabled: &HashMap<String, bool>,
+    cfg: &AppConfig,
     mut progress: impl FnMut(usize, usize, &str),
 ) -> SyncReport {
     let started_at = chrono::Local::now().to_rfc3339();
@@ -460,21 +510,21 @@ pub fn pull_all(
     let mut results = Vec::with_capacity(repos.len());
     for (index, r) in repos.iter().enumerate() {
         progress(index, total, &r.rel_path);
-        let on = *enabled.get(&r.rel_path).unwrap_or(&true);
-        if !on {
-            let pr = PullResult {
+        let settings = cfg.settings_for(&r.rel_path);
+        if !settings.enabled {
+            results.push(PullResult {
                 repo: r.clone(),
                 original_branch: r.branch.clone(),
+                final_branch: r.branch.clone(),
                 branches: Vec::new(),
                 had_local_changes: false,
                 stash_conflict: false,
                 skipped: Some("disabled".to_string()),
                 error: None,
-            };
-            results.push(pr);
+            });
             continue;
         }
-        results.push(pull(r));
+        results.push(pull(r, &settings, cfg.on_dirty));
     }
     SyncReport {
         started_at,

@@ -99,17 +99,17 @@ pub async fn sync_now(app: AppHandle) -> Result<repos::SyncReport, String> {
 
     let _ = app.emit("sync-started", ());
 
-    let (root, enabled, keep_days) = {
+    let (root, cfg_snapshot, keep_days) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        (cfg.root.clone(), cfg.repo_enabled.clone(), cfg.keep_reports_days)
+        (cfg.root.clone(), cfg.clone(), cfg.keep_reports_days)
     };
 
     // Heavy work on a blocking thread so we don't stall the runtime.
     let progress_app = app.clone();
     let report_result = tauri::async_runtime::spawn_blocking(move || {
         let list = repos::scan(&root);
-        repos::pull_all(&root, &list, &enabled, |index, total, rel_path| {
+        repos::pull_all(&root, &list, &cfg_snapshot, |index, total, rel_path| {
             let _ = progress_app.emit(
                 "sync-progress",
                 serde_json::json!({ "index": index, "total": total, "repo": rel_path }),
