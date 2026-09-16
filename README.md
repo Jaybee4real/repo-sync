@@ -1,3 +1,5 @@
+<img src=".github/banner.png" alt="repo-sync by Novacraft" width="100%">
+
 # repo-sync
 
 A menu-bar app (macOS + Windows) that keeps a folder of git repositories fast-forwarded, on a daily schedule. Built with [Tauri 2](https://tauri.app) and Svelte 5.
